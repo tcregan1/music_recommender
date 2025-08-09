@@ -21,6 +21,9 @@ from audio_segment import ensure_audio, ensure_clip
 from pathlib import Path
 from spotipy.oauth2 import SpotifyOAuth, CacheFileHandler  # CacheFileHandler is in recent Spotipy
 
+import local_cache as cache
+
+
 # =====================
 # CONFIG & AUTH
 # =====================
@@ -95,43 +98,42 @@ def make_clip(src_path: str, start_sec: int = 30, duration_sec: int = 45, sr: in
     subprocess.run(cmd, check=True)
     return clip_path
 
-def analyze_from_youtube(title_and_artist: str, *, title=None, artist=None):
+def analyze_from_youtube(title_and_artist: str, *, key=None, title=None, artist=None):
     """
     Returns a vector for 'title_and_artist', using cache if available.
-    Key = ytq_<slug>, stored under .cache/<key>/
+    If `key` is provided (e.g., spotify_<track_id>), that key is used for caching.
+    Otherwise we fall back to a slug from the title/artist/query.
     """
-    # Choose a cache key
-    if title is not None and artist is not None:
-        key = key_for_query(title, artist)
+    # Choose cache key
+    if key:
+        cache_key = key
+    elif title is not None and artist is not None:
+        cache_key = cache.key_for_query(title, artist)
     else:
-        # When you pass a single string "Track Artist", we still get a stable slug
-        parts = title_and_artist.split()
-        key = key_for_query(title_and_artist, "")  # simple slug on the full query
+        cache_key = cache.key_for_query(title_and_artist, "")  # slug from whole query
 
     # 1) Cached vector?
-    if exists(key):
-        vec, _meta = load(key)
+    if cache.exists(cache_key):
+        vec, _meta = cache.load(cache_key)
         print("✅ Cached vector hit")
         return vec
 
     # 2) Ensure audio + clip in cache
     print("🔎 Downloading (or using cached) audio…")
-    audio_path = ensure_audio(title_and_artist, key)
+    audio_path = ensure_audio(title_and_artist, cache_key)
     print("✂️  Trimming (or using cached) clip…")
-    clip_path = ensure_clip(audio_path, key)
+    clip_path = ensure_clip(audio_path, cache_key)
 
-    # 3) Run Essentia once
+    # 3) Run Essentia
     extractor = es.MusicExtractor(
         lowlevelStats=['mean', 'stdev'],
         rhythmStats=['mean'],
         tonalStats=['mean'],
     )
     features, _ = extractor(str(clip_path))
-
-    # Build your 53-D vector (your updated build_feature_vector function)
     vec = build_feature_vector(features)
 
-    # Optional: print a couple of quick values
+    # Optional: quick log
     names = set(features.descriptorNames())
     bpm = float(features['rhythm.bpm']) if 'rhythm.bpm' in names else 0.0
     print(f"BPM: {bpm:.1f} | Vector length: {len(vec)}")
@@ -140,13 +142,14 @@ def analyze_from_youtube(title_and_artist: str, *, title=None, artist=None):
     meta = {
         "title_and_artist": title_and_artist,
         "bpm": bpm,
-        "clip": str(paths_for_key(key)["clip"]),
-        "audio": str(paths_for_key(key)["audio"]),
+        "clip": str(cache.paths_for_key(cache_key)["clip"]),
+        "audio": str(cache.paths_for_key(cache_key)["audio"]),
         "dims": int(vec.shape[0]),
     }
-    save(key, vec, meta)
+    cache.save(cache_key, vec, meta)
     print("💾 Cached vector saved")
     return vec
+
 
 # =====================
 # ESSENTIA HELPERS
@@ -271,24 +274,118 @@ def get_track_pool(genre, limit_per_playlist=30):
                 track_pool.append((track["id"], track["name"], track["artists"][0]["name"]))
     return track_pool
 
+def get_genre_playlists(genres, per_genre=2):
+    """Return a list of playlist IDs for the given genres."""
+    pids = []
+    for g in genres:
+        res = sp.search(q=g, type="playlist", limit=per_genre)
+        pids.extend([p["id"] for p in res["playlists"]["items"] if p and p.get("id")])
+    return pids
+
+def get_playlist_tracks(playlist_id, limit=20):
+    """Return track dicts: {id, name, artist, preview_url} from one playlist."""
+    tracks = []
+    data = sp.playlist_tracks(playlist_id, limit=limit)
+    for item in data["items"]:
+        t = item.get("track")
+        if not t or not t.get("id"):
+            continue
+        tracks.append({
+            "id": t["id"],
+            "name": t["name"],
+            "artist": t["artists"][0]["name"],
+            "preview_url": t.get("preview_url"),
+        })
+    return tracks
+
+def build_candidate_pool(genres, per_genre=2, per_playlist=20, seed_id=None, cap=60):
+    """
+    Get up to `cap` unique candidate tracks from a few genre playlists.
+    Skips the seed track id.
+    """
+    pids = get_genre_playlists(genres, per_genre=per_genre)
+    pool, seen = [], set([seed_id] if seed_id else [])
+    for pid in pids:
+        for t in get_playlist_tracks(pid, limit=per_playlist):
+            tid = t["id"]
+            if tid and tid not in seen:
+                seen.add(tid)
+                pool.append(t)
+                if len(pool) >= cap:
+                    return pool
+    return pool
+
+
 # =====================
 # MAIN PROGRAM
 # =====================
 
 
 def main():
+    # 1) Pick seed
     result = get_user_input_song()
     if result is None:
         return
-    track_id, track_name, artist_name, artist_id = result
+    seed_id, seed_name, seed_artist, seed_artist_id = result
+    print(f"🎵 Song: {seed_name}")
+    print(f"🎤 Artist: {seed_artist}")
 
-    print(f"🎵 Song: {track_name}")
-    print(f"🎤 Artist: {artist_name}")
-    print("\nAnalyzing audio via YouTube (45s clip)…")
-    analyze_from_youtube(f"{track_name} {artist_name}")
-    seed_vec = analyze_from_youtube(f"{track_name} {artist_name}")
-    print(seed_vec)
+    # 2) Seed vector (cache key = spotify_<track_id>)
+    print("\nAnalyzing seed audio (cached if available)…")
+    seed_vec = analyze_from_youtube(
+        f"{seed_name} {seed_artist}",
+        key=cache.key_for_spotify(seed_id),
+        title=seed_name,
+        artist=seed_artist,
+    )
+    if seed_vec is None:
+        print("⚠️ Could not extract features for the seed track.")
+        return
 
+    # 3) Genres → candidate pool
+    genres = get_artist_genres(seed_artist_id)
+    if not genres:
+        print("⚠️ No genres found for this artist.")
+        return
+    print("🏷️ Genres:", ", ".join(genres))
+
+    candidates = build_candidate_pool(
+        genres,
+        per_genre=2,
+        per_playlist=20,
+        seed_id=seed_id,
+        cap=60,
+    )
+    print(f"📦 Candidates gathered: {len(candidates)}")
+
+    if not candidates:
+        print("⚠️ No candidates found.")
+        return
+
+    # 4) Score candidates
+    scored = []
+    for t in candidates:
+        key = cache.key_for_spotify(t["id"])
+        vec = analyze_from_youtube(f"{t['name']} {t['artist']}",
+                                   key=key, title=t["name"], artist=t["artist"])
+        if vec is None:
+            continue
+        sim = cosine_similarity(seed_vec, vec)
+        scored.append((t["id"], t["name"], t["artist"], sim))
+
+    if not scored:
+        print("⚠️ No features extracted for candidates.")
+        return
+
+    # 5) Top 20
+    scored.sort(key=lambda x: x[3], reverse=True)
+    top = scored[:20]
+
+    print("\n🏆 Top 20 similar tracks:")
+    for tid, name, artist, sim in top:
+        print(f"{sim:.3f}  {name} — {artist}")
+
+    
     
 
 
