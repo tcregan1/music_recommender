@@ -119,7 +119,7 @@ def analyze_from_youtube(title_and_artist: str, *, key=None, title=None, artist=
         return vec
 
     # 2) Ensure audio + clip in cache
-    print("🔎 Downloading (or using cached) audio…")
+    print(f"🔎 Downloading (or using cached) audio… for {title_and_artist}")
     audio_path = ensure_audio(title_and_artist, cache_key)
     print("✂️  Trimming (or using cached) clip…")
     clip_path = ensure_clip(audio_path, cache_key)
@@ -252,6 +252,7 @@ def get_artist_genres(artist_id):
     return genres[:2] if genres else []
 
 
+
 def get_spotify_track_metadata(track_id):
     track = sp.track(track_id)
     name = track["name"]
@@ -315,6 +316,28 @@ def build_candidate_pool(genres, per_genre=2, per_playlist=20, seed_id=None, cap
                     return pool
     return pool
 
+def create_playlist(top_scored, name):
+    # Create the playlist
+    playlist = sp.user_playlist_create(
+        user=sp.current_user()["id"],
+        name=name,
+        public=True,
+        description="This playlist was made using a python script"
+    )
+
+    # Extract IDs from (id, name, artist, sim) and dedupe while keeping order
+    seen = set()
+    track_ids = []
+    for tid, _, _, _ in top_scored:
+        if tid not in seen:
+            seen.add(tid)
+            track_ids.append(tid)
+
+    # Add in chunks of <= 100 (API limit)
+    for i in range(0, len(track_ids), 100):
+        sp.playlist_add_items(playlist_id=playlist["id"], items=track_ids[i:i+100])
+
+    print(f"✅ Playlist '{name}' created with {len(track_ids)} tracks.")
 
 # =====================
 # MAIN PROGRAM
@@ -386,7 +409,7 @@ def main():
         print(f"{sim:.3f}  {name} — {artist}")
 
     
-    
+    create_playlist(top, f"PYTHON MADE - {seed_name}")
 
 
 if __name__ == "__main__":
