@@ -26,6 +26,11 @@ def slugify(text: str) -> str:
 def key_for_spotify(track_id: str) -> str:
     return f"spotify_{track_id}"
 
+def pretty_spotify_key(title: str, artist: str, track_id: str) -> str:
+    human = slugify(f"{artist}-{title}")
+    return f"spotify_{human}-{track_id[:8]}"  # keeps uniqueness
+
+
 def key_for_query(title: str, artist: str) -> str:
     return f"ytq_{slugify(f'{title} {artist}')}"
 

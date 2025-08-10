@@ -105,6 +105,8 @@ def analyze_from_youtube(title_and_artist: str, *, key=None, title=None, artist=
     Otherwise we fall back to a slug from the title/artist/query.
     """
     # Choose cache key
+    import essentia
+    import essentia.standard as es
     if key:
         cache_key = key
     elif title is not None and artist is not None:
@@ -316,28 +318,156 @@ def build_candidate_pool(genres, per_genre=2, per_playlist=20, seed_id=None, cap
                     return pool
     return pool
 
-def create_playlist(top_scored, name):
-    # Create the playlist
+def create_playlist(top_scored, name, public=True, description="This playlist was made using a python script"):
+    """
+    Creates a Spotify playlist and adds tracks.
+    Accepts either:
+      - list of tuples: (track_id, name, artist, score)
+      - list of dicts:  {"id": ..., "name": ..., "artist": ..., "score": ...}
+    Returns a dict with playlist metadata for the API to return.
+    """
+    # 1) Create the playlist
+    user_id = sp.current_user()["id"]
     playlist = sp.user_playlist_create(
-        user=sp.current_user()["id"],
+        user=user_id,
         name=name,
-        public=True,
-        description="This playlist was made using a python script"
+        public=public,
+        description=description
     )
 
-    # Extract IDs from (id, name, artist, sim) and dedupe while keeping order
+    # 2) Normalize inputs and dedupe while preserving order
     seen = set()
     track_ids = []
-    for tid, _, _, _ in top_scored:
-        if tid not in seen:
+    for item in top_scored:
+        if isinstance(item, dict):
+            tid = item.get("id")
+        else:
+            tid = item[0] if item else None
+        if tid and tid not in seen:
             seen.add(tid)
             track_ids.append(tid)
 
-    # Add in chunks of <= 100 (API limit)
+    # 3) Add items in chunks of 100 (API limit)
     for i in range(0, len(track_ids), 100):
         sp.playlist_add_items(playlist_id=playlist["id"], items=track_ids[i:i+100])
 
-    print(f"✅ Playlist '{name}' created with {len(track_ids)} tracks.")
+    url = playlist["external_urls"]["spotify"]
+    count = len(track_ids)
+    print(f"✅ Playlist '{name}' created with {count} tracks. {url}")
+
+    # 4) Return metadata so the API can include it in JSON
+    return {"id": playlist["id"], "url": url, "count": count, "name": name, "public": public}
+    
+    
+# =====================
+# FAST API HELPERS
+# =====================
+
+
+from typing import Optional
+
+def _parse_track_id(seed: str) -> Optional[str]:
+    if not isinstance(seed, str):
+        return None
+    if seed.startswith("spotify:track:"):
+        return seed.split(":")[-1]
+    if "open.spotify.com/track/" in seed:
+        return seed.split("track/")[1].split("?")[0]
+    if seed.isalnum() and 10 <= len(seed) <= 40:
+        return seed
+    return None
+
+def _resolve_seed(seed_input: str):
+    """Return (seed_id, seed_name, seed_artist, seed_artist_id) from name/URL/URI/ID."""
+    tid = _parse_track_id(seed_input)
+    if tid:
+        t = sp.track(tid)
+        return t["id"], t["name"], t["artists"][0]["name"], t["artists"][0]["id"]
+
+    res = sp.search(q=seed_input, type="track", limit=1, market="GB")
+    items = res.get("tracks", {}).get("items", [])
+    if not items:
+        raise ValueError(f"No Spotify match for: {seed_input!r}")
+    t = items[0]
+    return t["id"], t["name"], t["artists"][0]["name"], t["artists"][0]["id"]
+
+def recommend_from_seed(seed_input: str, top_k: int = 20):
+    # 0) Resolve seed
+    seed_id, seed_name, seed_artist, seed_artist_id = _resolve_seed(seed_input)
+    print(f"[seed] {seed_name} — {seed_artist}  (id={seed_id}, artist_id={seed_artist_id})")
+
+    # 1) Seed features
+    seed_key = cache.key_for_spotify(seed_id)
+    seed_vec = analyze_from_youtube(f"{seed_name} {seed_artist}",
+                                    key=seed_key, title=seed_name, artist=seed_artist)
+    if seed_vec is None:
+        raise RuntimeError("Could not extract features for the seed track.")
+    print(f"[seed] features OK: len={len(seed_vec)}")
+
+    # 2) Genres
+    genres = get_artist_genres(seed_artist_id)
+    print(f"[genres] {genres}")
+    if not genres:
+        raise RuntimeError("No genres found for this artist.")
+
+    # 3) Candidates
+    candidates = build_candidate_pool(genres, per_genre=2, per_playlist=20,
+                                      seed_id=seed_id, cap=60)
+    print(f"[candidates] gathered={len(candidates)}")
+    if not candidates:
+        raise RuntimeError("No candidates found.")
+
+    # 4) Score candidates
+    scored = []
+    attempted = 0
+    succeeded = 0
+    last_err = None
+
+    for t in candidates:
+        attempted += 1
+        try:
+            key = cache.key_for_spotify(t["id"])
+            vec = analyze_from_youtube(f"{t['name']} {t['artist']}",
+                                       key=key, title=t["name"], artist=t["artist"])
+            if vec is None:
+                last_err = "feature_extractor returned None"
+                continue
+            sim = cosine_similarity(seed_vec, vec)
+            scored.append({"id": t["id"], "name": t["name"], "artist": t["artist"], "score": float(sim)})
+            succeeded += 1
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    print(f"[score] attempted={attempted} succeeded={succeeded} kept={len(scored)} last_err={last_err}")
+
+    if not scored:
+        raise RuntimeError(f"No features extracted for candidates. attempted={attempted} last_err={last_err}")
+
+    # 5) Sort + top K
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:top_k]
+
+
+def make_playlist_from_results(seed_title: str, scored_top):
+    """
+    scored_top: list of tuples (track_id, name, artist, score) OR list of dicts with those fields.
+    Returns the playlist URL (string).
+    """
+    # normalize to a list of tuples
+    normalized = []
+    for item in scored_top:
+        if isinstance(item, dict):
+            normalized.append((item["id"], item["name"], item["artist"], item["score"]))
+        else:
+            normalized.append(item)
+    name = f"PYTHON MADE - {seed_title}"
+    # This function already creates the playlist and adds tracks:
+    create_playlist(normalized, name)
+    # If your create_playlist() prints the URL but doesn't return it,
+    # you can make it return playlist['external_urls']['spotify'] instead.
+    # For now, just return the name to confirm.
+    return name  # replace with the actual URL if you modify create_playlist to return it
 
 # =====================
 # MAIN PROGRAM
